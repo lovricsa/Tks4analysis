@@ -1,0 +1,900 @@
+---
+title: "Tks4 analysis"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  bookdown::html_document2:
+    code_folding: hide
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, fig.height=5)
+```
+
+The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+
+The objective of this R Markdown code is to reproduce the correlation, multiple logistic regression and principal component analysis steps in the publication Tilajka et. al.
+
+# Libraries
+```{r libraries}
+list.of.packages <- c("openxlsx", "ggplot2", "tibble", "dplyr", "caret",
+                      "pROC", "corrplot", "ggcorrplot", "readr")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+library(openxlsx) # to read and write data from/to xlsx files
+library(ggplot2) # for nice plots
+library(tibble) # to use the tibble data structure
+library(dplyr) # for data manipulation
+library(caret) # for Classification And REgression Training
+library(pROC) # to easily plot ROC curves
+library(corrplot) # a really nice correlation plto
+library(ggcorrplot) # even nicer correlation plots
+library(readr) # to read tsv files
+```
+
+```{r global variables}
+out_sd_thr <- 6
+# define gene_list
+gene_list <- c("Tks4", "CD2AP", "GRB2", "WASL", "SRC", "CTTN", "CAPZA1")
+```
+
+
+# Input data
+Read in TCGA and RT-PCR data COAD data first.
+```{r input_data, cache=FALSE}
+tcga_infile <- file.path("Data/TCGA", "COAD_xenabrowser.tsv")
+tcga_indata <- read_tsv(tcga_infile)
+# use Tks4 instead of SH3PXD2B
+colnames(tcga_indata)[colnames(tcga_indata)=="SH3PXD2B"] <- "Tks4"
+# remove NA data
+tcga_indata <- tcga_indata[complete.cases(tcga_indata),]
+# change "sample_type" to Tumor unless "Solid Tissue Normal", in this case to Normal
+tcga_indata$sample_type[!tcga_indata$sample_type=="Solid Tissue Normal"] <- "tumor"
+tcga_indata$sample_type[tcga_indata$sample_type=="Solid Tissue Normal"] <- "normal"
+tcga_indata$sample <- NULL
+# print(tcga_indata)
+rtpcr_infile <- file.path("Data", "RT_PCR.xlsx")
+rtpcr_indata <- tibble::as_tibble(openxlsx::read.xlsx(rtpcr_infile, sheet = "forditott_delta_ct"))
+colnames(rtpcr_indata)[colnames(rtpcr_indata)=="NWASP"] <- "WASL"
+rtpcr_indata$samples <- as.character(rtpcr_indata$samples)
+```
+
+Some data manipulation.
+```{r merge_data, cache=FALSE}
+# use common columns only
+common_columns <- intersect(colnames(tcga_indata), colnames(rtpcr_indata))
+tcga_indata <- tcga_indata[, colnames(tcga_indata)[match(common_columns, colnames(tcga_indata))]]
+rtpcr_indata <- rtpcr_indata[, colnames(rtpcr_indata)[match(common_columns, colnames(rtpcr_indata))]]
+# add data type column to differentiate when the datasets are put on the same plot
+tcga_indata$data_type <- "TCGA"
+rtpcr_indata$data_type <- "RT-PCR"
+# use the genes in the given order
+tcga_indata <- tcga_indata[, c("samples", gene_list, "sample_type", "data_type")]
+rtpcr_indata <- rtpcr_indata[, c("samples", gene_list, "sample_type", "data_type")]
+
+# USE scaled datasets
+tcga_indata[, gene_list] <- scale(tcga_indata[, gene_list], center=T, scale=T)
+rtpcr_indata[, gene_list] <- scale(rtpcr_indata[, gene_list], center=T, scale=T)
+```
+
+# Outlier detection
+Output figures are not shown, since no outlier was detected.
+
+```{r check for outliers, fig.show='hide'}
+# kvalue <- 10
+# out_scores <- LOF(rtpcr_indata[, gene_list], kvalue)
+# plot(density(out_scores))
+
+# repeat with PCA
+indata_mx <- as.matrix(tcga_indata[, gene_list])
+rownames(indata_mx) <- tcga_indata$samples
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res_mx <- pca$x
+outlier_list <- list()
+for (cname in colnames(pca_res_mx)){
+  x <- pca_res_mx[,cname]
+  outlier_list[[cname]] <- which( abs(x - mean(x)) > (out_sd_thr * sd(x)))
+}
+
+# show them in red
+pca_res <- as_tibble(pca$x, rownames = "samples")
+pca_annot <- inner_join(pca_res, tcga_indata, by=c("samples"))
+pca_annot$outlier <- "0"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC1)] <- "1"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC2)] <- "2"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC3)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC4)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC5)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC6)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC7)] <- "3"
+# plot the results of the PCA analysis
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, shape = sample_type, col=outlier),
+             size = 1, stroke = 1, fill="white")+
+  # color points as required
+  scale_shape_manual("sample type", values = c("tumor" = 1, "normal" = 2))+
+  scale_color_manual("outlier", values = c("0"="black", "1"="red", 
+                  "2"="darkgreen", "3"="darkblue"))+
+  #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=1)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+```
+
+```{r check for outliers seperately for tumor, fig.show='hide'}
+indata_mx <- as.matrix(tcga_indata[tcga_indata$sample_type=="tumor", gene_list])
+rownames(indata_mx) <- tcga_indata$samples[tcga_indata$sample_type=="tumor"]
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res_mx <- pca$x
+outlier_list <- list()
+for (cname in colnames(pca_res_mx)){
+  x <- pca_res_mx[,cname]
+  outlier_list[[cname]] <- which( abs(x - mean(x)) > (out_sd_thr * sd(x)))
+}
+
+# repeat pca analisis for all samples
+indata_mx <- as.matrix(tcga_indata[, gene_list])
+rownames(indata_mx) <- tcga_indata$samples
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res <- as_tibble(pca$x, rownames = "samples")
+pca_annot <- inner_join(pca_res, tcga_indata, by=c("samples"))
+pca_annot$outlier <- "0"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC1)] <- "1"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC2)] <- "2"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC3)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC4)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC5)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC6)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC7)] <- "3"
+# plot the results of the PCA analysis
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, shape=sample_type, col=outlier),
+             size = 1, stroke = 1, fill="white")+
+  # color points as required
+  scale_shape_manual("sample type", values = c("tumor" = 1, "normal" = 2))+
+  scale_color_manual("outlier", values = c("0"="black", "1"="red", 
+                  "2"="darkgreen", "3"="darkblue"))+
+  #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=1)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+```
+
+```{r check for outliers seperately for normal, fig.show='hide'}
+indata_mx <- as.matrix(tcga_indata[tcga_indata$sample_type=="normal", gene_list])
+rownames(indata_mx) <- tcga_indata$samples[tcga_indata$sample_type=="normal"]
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res_mx <- pca$x
+for (cname in colnames(pca_res_mx)){   
+  x <- pca_res_mx[,cname]   
+  outlier_list[[cname]] <- which( abs(x - mean(x)) > (out_sd_thr * sd(x))) 
+}
+
+# repeat pca analisis for all samples
+indata_mx <- as.matrix(tcga_indata[, gene_list])
+rownames(indata_mx) <- tcga_indata$samples
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res <- as_tibble(pca$x, rownames = "samples")
+pca_annot <- inner_join(pca_res, tcga_indata, by=c("samples"))
+pca_annot$outlier <- "0"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC1)] <- "1"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC2)] <- "2"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC3)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC4)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC5)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC6)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC7)] <- "3"
+# plot the results of the PCA analysis
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, shape=sample_type, col=outlier),
+             size = 1, stroke = 1, fill="white")+
+  # color points as required
+  scale_shape_manual("sample type", values = c("tumor" = 1, "normal" = 2))+
+  scale_color_manual("outlier", values = c("0"="black", "1"="red", 
+                  "2"="darkgreen", "3"="darkblue"))+
+  #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=1)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+```
+
+```{r check for outliers in RT-PCR, fig.show='hide'}
+# repeat with PCA
+indata_mx <- as.matrix(rtpcr_indata[, gene_list])
+rownames(indata_mx) <- rtpcr_indata$samples
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res_mx <- pca$x
+outlier_list <- list()
+for (cname in colnames(pca_res_mx)){
+  x <- pca_res_mx[,cname]
+  outlier_list[[cname]] <- which( abs(x - mean(x)) > (out_sd_thr * sd(x)))
+}
+
+
+# show them in red
+pca_res <- as_tibble(pca$x, rownames = "samples")
+pca_annot <- inner_join(pca_res, rtpcr_indata, by=c("samples"))
+pca_annot$outlier <- "0"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC1)] <- "1"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC2)] <- "2"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC3)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC4)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC5)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC6)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC7)] <- "3"
+# plot the results of the PCA analysis
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, shape = sample_type, col=outlier),
+             size = 1, stroke = 1, fill="white")+
+  # color points as required
+  scale_shape_manual("sample type", values = c("tumor" = 1, "normal" = 2))+
+  scale_color_manual("outlier", values = c("0"="black", "1"="red", 
+                  "2"="darkgreen", "3"="darkblue"))+
+  #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=5)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+```
+
+```{r check for outliers seperately for normal in RT-PCR, fig.show='hide'}
+indata_mx <- as.matrix(rtpcr_indata[rtpcr_indata$sample_type=="normal", gene_list])
+rownames(indata_mx) <- rtpcr_indata$samples[rtpcr_indata$sample_type=="normal"]
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res_mx <- pca$x
+outlier_list <- list()
+for (cname in colnames(pca_res_mx)){
+  x <- pca_res_mx[,cname]
+  outlier_list[[cname]] <- which( abs(x - mean(x)) > (out_sd_thr * sd(x)))
+}
+
+
+# repeat pca analisis for all samples
+indata_mx <- as.matrix(rtpcr_indata[, gene_list])
+rownames(indata_mx) <- rtpcr_indata$samples
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res <- as_tibble(pca$x, rownames = "samples")
+pca_annot <- inner_join(pca_res, rtpcr_indata, by=c("samples"))
+pca_annot$outlier <- "0"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC1)] <- "1"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC2)] <- "2"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC3)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC4)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC5)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC6)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC7)] <- "3"
+# plot the results of the PCA analysis
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, shape=sample_type, col=outlier),
+             size = 1, stroke = 1, fill="white")+
+  # color points as required
+  scale_shape_manual("sample type", values = c("tumor" = 1, "normal" = 2))+
+  scale_color_manual("outlier", values = c("0"="black", "1"="red", 
+                  "2"="darkgreen", "3"="darkblue"))+
+  #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=1)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+```
+
+```{r check for outliers seperately for tumor in RT-PCR, fig.show='hide'}
+indata_mx <- as.matrix(rtpcr_indata[rtpcr_indata$sample_type=="tumor", gene_list])
+rownames(indata_mx) <- rtpcr_indata$samples[rtpcr_indata$sample_type=="tumor"]
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res_mx <- pca$x
+outlier_list <- list()
+for (cname in colnames(pca_res_mx)){
+  x <- pca_res_mx[,cname]
+  outlier_list[[cname]] <- which( abs(x - mean(x)) > (out_sd_thr * sd(x)))
+}
+
+
+# repeat pca analisis for all samples
+indata_mx <- as.matrix(rtpcr_indata[, gene_list])
+rownames(indata_mx) <- rtpcr_indata$samples
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res <- as_tibble(pca$x, rownames = "samples")
+pca_annot <- inner_join(pca_res, rtpcr_indata, by=c("samples"))
+pca_annot$outlier <- "0"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC1)] <- "1"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC2)] <- "2"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC3)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC4)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC5)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC6)] <- "3"
+pca_annot$outlier[pca_annot$samples %in% names(outlier_list$PC7)] <- "3"
+# plot the results of the PCA analysis
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, shape=sample_type, col=outlier),
+             size = 1, stroke = 1, fill="white")+
+  # color points as required
+  scale_shape_manual("sample type", values = c("tumor" = 1, "normal" = 2))+
+  scale_color_manual("outlier", values = c("0"="black", "1"="red", 
+                  "2"="darkgreen", "3"="darkblue"))+
+  #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=1)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+```
+
+
+
+# Correlation
+Correlation between the gene expressions.
+```{r correlation between the independent variables in tcga, out.width="50%", fig.cap=paste("Correlation of", c("tumor", "normal"), c(rep("TCGA",2), rep("RT-PCR",2), rep("GTEX",2)))}
+# ```{r correlation between the independent variables in tcga, fig.show="hold", out.width="50%", fig.cap=paste("Correlation of", c("tumor", "normal"), c(rep("TCGA",2), rep("RT-PCR",2), rep("GTEX",2)))}
+for (exptype in c("tcga", "rtpcr")){
+  if (exptype == "tcga") indata <- tcga_indata
+  if (exptype == "rtpcr") indata <- rtpcr_indata
+  for (stype in c("tumor", "normal")){
+    M <- cor(indata[indata$sample_type==stype, gene_list])
+    figfile <- file.path("Figures",
+                paste("correlation_", exptype, "_", stype, ".pdf", sep=""))
+    # p <- ggcorrplot(M, method="circle", type = "upper", lab = TRUE) +
+    #   scale_y_discrete(limits=rev(colnames(M)))
+    # plot(p)
+    # ggsave(figfile, width=8, height=7)
+    pdf(file = figfile,  
+    width = 5.5, # The width of the plot in inches
+    height = 5)
+    corrplot(M, tl.col="black", type="lower")  # visualization of correlation matrix
+    dev.off()
+    # show in the html as well
+    corrplot(M, tl.col="black", type="lower")
+    # another plot with the p-values as well
+    M <- Hmisc::rcorr(as.matrix(indata[indata$sample_type==stype, gene_list]), 
+               type="pearson")
+    Mr <- M$r
+    Mp <- M$P
+    Mp[is.na(Mp)] <- 0
+    figfile <- file.path("Figures",
+                paste("correlation_", exptype, "_", stype, "_pvalues.pdf", sep=""))
+    pdf(file = figfile,  
+    width = 5.5, # The width of the plot in inches
+    height = 5)
+    corrplot(corr=Mr, tl.col="black", type="lower",
+             p.mat = Mp) 
+    # corrplot::corrplot(Mr, type = "lower", insig = "p-value",
+    #           p.mat = Mp, sig.level = -1, tl.cex = 1.25, tl.col = "black",
+    #           cl.cex=1.25, title = "")
+    dev.off()
+  }
+}
+
+```
+
+
+# Logistic regression
+Predict tumor samples using a multiple logistic regression model of gene expressions. Calculate
+confusion matrix and ROC curve to quantify model performance. Check importance of each gene.
+Define reduced model based on a reduced set of genes and check how well that performs.
+
+```{r muliple logistic regression on tcga data, fig.cap=c("ROC full multiple logistic regression model on test set","ROC reduced gene set multiple logistic regression model on test set")}
+set.seed(3007) # set seed for reproducibility
+train_rows <- createDataPartition(as.factor(tcga_indata$sample_type), p = 0.75, list = FALSE)
+tcga_indata_train <- tcga_indata[train_rows,]
+tcga_indata_test <- tcga_indata[-train_rows,]
+ctrlspecs <- trainControl(method="LOOCV", 
+                          savePredictions="all",
+                          classProbs=TRUE)
+# multiple logistic regression with all genes
+logreg_model0 <- train(
+                      sample_type ~ (Tks4 + CD2AP + CAPZA1 + SRC + WASL + GRB2 +  CTTN), 
+                      data=tcga_indata_train,
+                      method="glm",
+                      preProcess=NULL,
+                      family=binomial,
+                      trControl=ctrlspecs)
+summary(logreg_model0)
+varImp(logreg_model0)
+# predict response
+logreg_model0_resp <- predict(logreg_model0, newdata=tcga_indata_test)
+logreg_model0_prob <- predict(logreg_model0, newdata=tcga_indata_test, type="prob")
+# calculate roc curve
+roc_res <- roc(response = tcga_indata_test$sample_type,
+                predictor = logreg_model0_prob$tumor)
+# plot in ggplot instead
+roc_res_plot <- as_tibble(cbind(roc_res$sensitivities,
+                                1-roc_res$specificities))
+colnames(roc_res_plot) <- c("TPR", "FPR")
+
+# sort by TPR
+roc_res_plot <- roc_res_plot[order(roc_res_plot$TPR),]
+mylabel <- paste('AUC = ', 
+              as.character(format(round(roc_res$auc, digits=2), nsmall = 2)), 
+              sep="")
+p <- ggplot(data=roc_res_plot) +
+  geom_line(mapping=aes(x = FPR, y = TPR))+
+  geom_text(mapping = aes(x=0.7, y=0.15), label=mylabel,
+            size=8, family="Courier")+
+    ggtitle("sample type ~ Tks4 + CD2AP + CAPZA1 + \n SRC + WASL + GRB2 + CTTN")+
+   # change the default font size in the grey theme
+  theme_gray(base_size = 16)+
+  theme(plot.title = element_text(size = 12, face = "bold", hjust=0.5))
+plot(p)
+resfile <- file.path("Figures", 
+                     paste("ROC_logreg_model_test_", "all", ".pdf", sep=""))
+ggsave(resfile, plot=p, width=5, height=5)
+# confusion matrix from the folds
+conf_mx <- confusionMatrix(data=logreg_model0_resp, 
+                           reference=as.factor(tcga_indata_test$sample_type),
+                           positive="tumor")
+print("########################")
+print("multiple logistic regression of TCGA data with seven genes")
+print(conf_mx, digits = 2) 
+print("########################")
+
+# repeat for reduced set of variables
+logreg_model1 <- train(
+                      sample_type ~ (Tks4 + SRC + WASL + GRB2),
+                      data=tcga_indata_train,
+                      method="glm",
+                      preProcess=NULL,
+                      family=binomial,
+                      trControl=ctrlspecs)
+summary(logreg_model1)
+
+# predict response                                                       
+logreg_model1_resp <- predict(logreg_model1, newdata=tcga_indata_test)
+logreg_model1_prob <- predict(logreg_model1, newdata=tcga_indata_test, type="prob")
+# calculate roc curve
+roc_res1 <- roc(response = tcga_indata_test$sample_type,
+                predictor = logreg_model1_prob$tumor)
+
+# plot in ggplot instead
+roc_res_plot <- as_tibble(cbind(roc_res1$sensitivities,
+                                1-roc_res1$specificities))
+colnames(roc_res_plot) <- c("TPR", "FPR")
+# sort by TPR
+roc_res_plot <- roc_res_plot[order(roc_res_plot$TPR),]
+mylabel <- paste('AUC = ',
+              as.character(format(round(roc_res$auc, digits=2), nsmall = 2)),
+              sep="")
+p <- ggplot(data=roc_res_plot) +
+  geom_line(mapping=aes(x = FPR, y = TPR))+
+  geom_text(mapping = aes(x=0.7, y=0.15), label=mylabel,
+            size=8, family="Courier")+
+  ggtitle("sample type ~ Tks4 + SRC + WASL + GRB2")+
+   # change the default font size in the grey theme
+  theme_gray(base_size = 16)+
+  theme(plot.title = element_text(size = 12, face = "bold", hjust=0.5))
+plot(p)
+resfile <- file.path("Figures",
+                     paste("ROC_logreg_model_test_reduced_", "all", ".pdf"))
+ggsave(resfile, plot=p, width=5, height=5)
+# confusion matrix from the folds
+conf_mx <- confusionMatrix(data=logreg_model1_resp,
+                           reference=as.factor(tcga_indata_test$sample_type),
+                           positive="tumor")
+print("########################")
+print("multiple logistic regression of TCGA data with four genes")
+print(conf_mx, digits = 2)
+print("########################")
+```
+
+
+Test how well each gene would predict "tumor" if used individually. Compute confusion matrices and plot ROC curves for individual genes.
+```{r ROC curves for predicting "tumor" using individual genes, fig.cap=paste("single logistic regression model with gene", gene_list)}
+# use the same training and test set and ctrlspecs
+# repeat for each gene
+set.seed(876) # set seed for reproducibility
+for (sel_gene_name in gene_list){
+  sel_gene <- as.symbol(sel_gene_name)
+  logreg_model0 <- train(
+                        eval(bquote(sample_type ~ .(sel_gene))),
+                        data=tcga_indata_train,
+                        method="glm",
+                        preProcess=NULL,
+                        family=binomial,
+                        trControl=ctrlspecs)
+  
+  logreg_model0_resp <- predict(logreg_model0, newdata = tcga_indata_test)
+  logreg_model0_prob <- predict(logreg_model0, newdata = tcga_indata_test, type="prob")
+  # calculate roc curve
+  roc_res <- roc(response = tcga_indata_test$sample_type,
+                predictor = logreg_model0_prob$tumor)
+  # plot in ggplot instead
+  roc_res_plot <- as_tibble(cbind(roc_res$sensitivities,
+                                  1-roc_res$specificities))
+  colnames(roc_res_plot) <- c("TPR", "FPR")
+  # sort by TPR
+  roc_res_plot <- roc_res_plot[order(roc_res_plot$TPR),]
+  mylabel <- paste('AUC = ', 
+                as.character(format(round(roc_res$auc, digits=2), nsmall = 2)), 
+                sep="")
+  p <- ggplot(data=roc_res_plot) +
+    geom_line(mapping=aes(x = FPR, y = TPR))+
+    geom_text(mapping = aes(x=0.7, y=0.15), label=mylabel,
+              size=8, family="Courier")+
+  ggtitle(paste("sample type ~ ", sel_gene, sep=""))+
+   # change the default font size in the grey theme
+  theme_gray(base_size = 16)+
+  theme(plot.title = element_text(size = 12, face = "bold", hjust=0.5))
+  plot(p)
+  resfile <- file.path("Figures", 
+                       paste("ROC_logreg_model_", sel_gene_name, ".pdf"))
+  ggsave(resfile, plot=p, width=5, height=5)
+  # confusion matrix from the folds
+  conf_mx <- confusionMatrix(data=logreg_model0_resp, 
+                           reference=as.factor(tcga_indata_test$sample_type),
+                           positive="tumor")
+  print("########################")
+  print(sel_gene_name)
+  print(conf_mx, digits = 2) 
+  print("########################")
+}
+```
+
+
+# PCA analysis using the set of 7 genes
+PCA is conducted on the TCGA data, then the obtained transformation is applied to the other data.
+PCA: unsurpervised analysis (i.e. we do not take into account the knowledge,
+whether a sample is normal or tumor) - and observe that the variance
+observed between the data points is partly _due_ to sample type.
+```{r pca plot tcga with the original set of 7-genes, fig.cap=c("TCGA 7-genes PCA: scree plot", "TCGA 7-genes PCA: PCA plot"), fig.width=c(3,7)}
+gene_list <- c("Tks4", "CD2AP", "GRB2", "WASL", "SRC", "CTTN", "CAPZA1")
+indata_mx <- as.matrix(tcga_indata[, gene_list])
+rownames(indata_mx) <- tcga_indata$samples
+
+# scaling does not do anything, as input data is already centered and scaled
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+# scree plot
+pca.var <- pca$sdev^2
+pca.var.per <- round(pca.var/sum(pca.var)*100, 1)
+
+sumvar <- 0
+maxi <- 1
+for (pcind in 1:length(pca.var)){
+  sumvar <- sumvar + pca.var.per[pcind]
+  #print(c(pcind, sumvar))
+  if (sumvar > 99.99){
+ # if (sumvar >= 100){
+    maxi <- pcind
+    #print(maxi)
+    break
+  }
+}
+vardf <- as.data.frame(cbind('PC'=1:maxi, 'variance'=pca.var.per[1:maxi]))
+
+p <- ggplot(data=vardf) +
+  geom_col(mapping=aes(x=PC, y=cumsum(variance)))+
+  xlab("Principal Component") +  ylab("Cumulative percent variation") +
+  geom_hline(yintercept=95, linetype="dashed",
+             color = "red", linewidth=1)
+plot(p)
+# save scree plot as well
+figfile <- file.path("Figures", 
+                     "PCA_TCGA_7-genes_scree_plot.pdf")
+ggsave(figfile, plot=p, height=5, width=5)
+# now plot a PCA plot with annotation
+pca_res <- as_tibble(pca$x, rownames = "samples")
+pca_annot <- inner_join(pca_res, tcga_indata, by=c("samples"))
+
+nicexlabel <- paste('PC1 (', as.character(vardf$variance[1]), '%)', sep="")
+niceylabel <- paste('PC2 (', as.character(vardf$variance[2]), '%)', sep="")
+
+# plot the results of the PCA analysis
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, col = sample_type),
+             size = 1, stroke = 1, fill="white")+
+  # color points as required
+  scale_color_manual("sample type", values = c("tumor" = "red", "normal" = "blue"))+
+  labs(x = nicexlabel, y = niceylabel)+
+  #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=1)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+resfile <- file.path("Figures", 
+                     "PCA_TCGA_7-genes_pca_plot.pdf")
+#gsave(resfile, plot=p, width=20, height=12)
+ggsave(resfile, plot=p, width=10, height=6)  
+```
+
+The obtained PCA transformation is used to tranform the RT-PCR data points:
+we see very similar separation between tumor and normal.
+```{r TCGA 7-genes PCA transformation on RT-PCR data, fig.cap=c("RT-PCR data in the PCA transformed space of TCGA data", "RT-PCR data along with TCGA data in the PCA transformed space of TCGA data"), fig.width=c(7,7)}
+# also do the transformation on the RT-PCR data
+# calculate the pca transformation again for clarity
+indata_mx <- as.matrix(tcga_indata[, gene_list])
+rownames(indata_mx) <- tcga_indata$samples
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res <- as_tibble(pca$x, rownames = "samples")
+pca_annot <- inner_join(pca_res, tcga_indata, by=c("samples"))
+newdata_mx <- as.matrix(rtpcr_indata[, gene_list])
+newdata_pca <- predict(pca, newdata=newdata_mx)
+newdata_pca <- as_tibble(newdata_pca, rownames = "samples")
+newdata_pca_annot <- inner_join(newdata_pca, rtpcr_indata, by=c("samples"))
+# plot the results of the PCA transformation by itself first
+p <- ggplot(data=newdata_pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, col = sample_type),
+             size = 1, stroke = 1, fill="white")+
+  # color points as required
+  scale_color_manual("sample type", values = c("tumor" = "red", "normal" = "blue"))+
+  labs(x = nicexlabel, y = niceylabel)+
+  #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=1)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+resfile <- file.path("Figures", "PCA_TCGA_7-genes_pca_plot_newdata_RTPCR.pdf")
+ggsave(resfile, plot=p, width=10, height=6)
+
+
+# plot together with TCGA data
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, col = sample_type,
+                         shape=data_type),
+             size = 1, stroke = 1, fill="white")+
+  geom_point(data=newdata_pca_annot,
+             mapping=aes(x = PC1, y = PC2, col = sample_type, shape=data_type),
+             size = 2)+
+  # color points as required
+  scale_color_manual("sample type", values = c("tumor" = "red", "normal" = "blue"))+
+  # add diferent shypes
+  scale_shape_manual("data type", values = c("TCGA" = 1, "RT-PCR" = 5))+
+  labs(x = nicexlabel, y = niceylabel)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+# also save as a seperate plot
+resfile <- file.path("Figures", "PCA_TCGA_7-genes_pca_plot_orig_plus_newdata_RTPCR.pdf")
+ggsave(resfile, plot=p, width=10, height=6)
+```
+
+# PCA analysis using the set of 4 genes (aka reduced_genes)
+```{r pca plot tcga with the reduced set of genes, fig.cap=c("TCGA PCA: scree plot", "TCGA PCA: PCA plot"), fig.width=c(3,7)}
+gene_list_reduced <- c( "Tks4", "SRC", "WASL", "GRB2")
+indata_mx <- as.matrix(tcga_indata[, gene_list_reduced])
+rownames(indata_mx) <- tcga_indata$samples
+
+# scaling does not do anything, as input data is already centered and scaled
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+# scree plot
+pca.var <- pca$sdev^2
+pca.var.per <- round(pca.var/sum(pca.var)*100, 1)
+
+sumvar <- 0
+maxi <- 1
+for (pcind in 1:length(pca.var)){
+  sumvar <- sumvar + pca.var.per[pcind]
+  #print(c(pcind, sumvar))
+  if (sumvar > 99.99){
+ # if (sumvar >= 100){
+    maxi <- pcind
+    #print(maxi)
+    break
+  }
+}
+vardf <- as.data.frame(cbind('PC'=1:maxi, 'variance'=pca.var.per[1:maxi]))
+
+p <- ggplot(data=vardf) +
+  geom_col(mapping=aes(x=PC, y=cumsum(variance)))+
+  xlab("Principal Component") +  ylab("Cumulative percent variation") +
+  geom_hline(yintercept=95, linetype="dashed",
+             color = "red", linewidth=1)
+plot(p)
+# save scree plot as well
+figfile <- file.path("Figures", 
+                     "PCA_TCGA_reduced_genes_scree_plot.pdf")
+ggsave(figfile, plot=p, height=5, width=5)
+# now plot a PCA plot with annotation
+pca_res <- as_tibble(pca$x, rownames = "samples")
+pca_annot <- inner_join(pca_res, tcga_indata, by=c("samples"))
+
+nicexlabel <- paste('PC1 (', as.character(vardf$variance[1]), '%)', sep="")
+niceylabel <- paste('PC2 (', as.character(vardf$variance[2]), '%)', sep="")
+
+# plot the results of the PCA analysis
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, col = sample_type),
+             size = 1, stroke = 1, fill="white")+
+  # color points as required
+  scale_color_manual("sample type", values = c("tumor" = "red", "normal" = "blue"))+
+  labs(x = nicexlabel, y = niceylabel)+
+  #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=1)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+resfile <- file.path("Figures", 
+                     "PCA_TCGA_reduced_genes_pca_plot.pdf")
+#gsave(resfile, plot=p, width=20, height=12)
+ggsave(resfile, plot=p, width=10, height=6)  
+```
+
+The obtained PCA transformation is used to tranform the RT-PCR data points:
+we see very similar seperation between tumor and normal.
+```{r TCGA reduced genes PCA transformation on RT-PCR data, fig.cap=c("RT-PCR data in the PCA transformed space of TCGA data", "RT-PCR data along with TCGA data in the PCA transformed space of TCGA data"), fig.width=c(7,7)}
+# also do the transformation on the RT-PCR data
+# calculate the pca transformation again for clarity
+indata_mx <- as.matrix(tcga_indata[, gene_list_reduced])
+rownames(indata_mx) <- tcga_indata$samples
+pca <- prcomp(indata_mx, center=T, scale=T,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+pca_res <- as_tibble(pca$x, rownames = "samples")
+pca_annot <- inner_join(pca_res, tcga_indata, by=c("samples"))
+newdata_mx <- as.matrix(rtpcr_indata[, gene_list_reduced])
+newdata_pca <- predict(pca, newdata=newdata_mx)
+newdata_pca <- as_tibble(newdata_pca, rownames = "samples")
+newdata_pca_annot <- inner_join(newdata_pca, rtpcr_indata, by=c("samples"))
+# plot the results of the PCA transformation by itself first
+p <- ggplot(data=newdata_pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, col = sample_type),
+             size = 1, stroke = 1, fill="white")+
+  # color points as required
+  scale_color_manual("sample type", values = c("tumor" = "red", "normal" = "blue"))+
+  labs(x = nicexlabel, y = niceylabel)+
+  #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=1)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+resfile <- file.path("Figures", "PCA_TCGA_reduced_genes_pca_plot_newdata_RTPCR.pdf")
+ggsave(resfile, plot=p, width=10, height=6)
+
+
+# plot together with TCGA data
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, col = sample_type,
+                         shape=data_type),
+             size = 1, stroke = 1, fill="white")+
+  geom_point(data=newdata_pca_annot,
+             mapping=aes(x = PC1, y = PC2, col = sample_type, shape=data_type),
+             size = 2)+
+  # color points as required
+  scale_color_manual("sample type", values = c("tumor" = "red", "normal" = "blue"))+
+  # add diferent shypes
+  scale_shape_manual("data type", values = c("TCGA" = 1, "RT-PCR" = 5))+
+  labs(x = nicexlabel, y = niceylabel)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+# also save as a seperate plot
+resfile <- file.path("Figures", "PCA_TCGA_reduced_genes_pca_plot_orig_plus_newdata_RTPCR.pdf")
+ggsave(resfile, plot=p, width=10, height=6)
+```
+
+
+# Other cancer types.
+Finally read in data for the other cancer types
+```{r read in data for different cancer types}
+ctypes <- c("LIHC", "STAD")
+other_data <- list()
+for (ctype in ctypes){
+  infile <- file.path("Data/TCGA", paste(ctype, "xenabrowser.tsv", sep="_"))
+  other_data[[ctype]] <- read_tsv(infile)
+  # remove NA data
+  other_data[[ctype]] <- other_data[[ctype]][complete.cases(other_data[[ctype]]),]
+  # use tumor & normal notation (do not care about different grades)
+  other_data[[ctype]]$sample_type[!other_data[[ctype]]$sample_type=="Solid Tissue Normal"] <- "tumor"
+  other_data[[ctype]]$sample_type[other_data[[ctype]]$sample_type=="Solid Tissue Normal"] <- "normal"
+  colnames(other_data[[ctype]])[colnames(other_data[[ctype]])=="SH3PXD2B"] <- "Tks4"
+  other_data[[ctype]]$sample <- NULL
+  other_data[[ctype]]$data_type <- "TCGA"
+  # use the same order as for the original data
+  other_data[[ctype]]  <- other_data[[ctype]][, colnames(other_data[[ctype]])[
+    match(common_columns, colnames(other_data[[ctype]]))]]
+}
+
+```
+
+Using logistic regression, create a ROC curve for each.
+```{r logistic regression for different cancer types, fig.cap=paste("ROC curve of the multiple linear regression model for TCGA cancer type", names(other_data))}
+# repeat for reduced set of variables
+ctrlspecs <- trainControl(method="LOOCV", 
+                          savePredictions="all",
+                          classProbs=TRUE)
+for (ctype in names(other_data)){
+  tmp_data <- other_data[[ctype]]
+  train_rows <- createDataPartition(as.factor(tmp_data$sample_type), p = 0.75, list = FALSE)
+  tmp_data_train <- tmp_data[train_rows,]
+  tmp_data_test <- tmp_data[-train_rows,]
+  logreg_model1 <- train(
+                      sample_type ~ (Tks4 + SRC + WASL + GRB2), 
+                      data=tmp_data_train,
+                      method="glm",
+                      preProcess=NULL,
+                      family=binomial,
+                      trControl=ctrlspecs)
+  summary(logreg_model1)
+  # predict response
+  logreg_model1_resp <- predict(logreg_model1, newdata = tmp_data_test)
+  logreg_model1_prob <- predict(logreg_model1, newdata = tmp_data_test, type="prob")
+  # calculate roc curve
+  roc_res <- roc(response = tmp_data_test$sample_type,
+                  predictor = logreg_model1_prob$tumor)
+  # plot in ggplot instead
+  roc_res_plot <- as_tibble(cbind(roc_res$sensitivities,
+                                  1-roc_res$specificities))
+  colnames(roc_res_plot) <- c("TPR", "FPR")
+  # sort by TPR
+  roc_res_plot <- roc_res_plot[order(roc_res_plot$TPR),]
+  mylabel <- paste(ctype, ' AUC = ', 
+                as.character(format(round(roc_res$auc, digits=2), nsmall = 2)), 
+                sep="")
+  p <- ggplot(data=roc_res_plot) +
+    geom_line(mapping=aes(x = FPR, y = TPR))+
+    geom_text(mapping = aes(x=0.55, y=0.15), label=mylabel,
+              size=8, family="Courier")+
+    ggtitle("sample type ~ Tks4 + SRC + WASL + GRB2")+
+     # change the default font size in the grey theme
+    theme_gray(base_size = 16)+
+    theme(plot.title = element_text(size = 12, face = "bold", hjust=0.5))
+  plot(p)
+  resfile <- file.path("Figures", 
+                       paste("ROC_logreg_model_reduced_", ctype, ".pdf"))
+  ggsave(resfile, plot=p, width=5, height=5)
+  # confusion matrix from the folds
+  conf_mx <- confusionMatrix(data=logreg_model1_resp, 
+                             reference=as.factor(tmp_data_test$sample_type),
+                             positive="tumor")
+  print("########################")
+  print(ctype)
+  print(conf_mx, digits = 2) 
+  print("########################") 
+}
+```
+
+Also plot PCA for each (now calculate the PCA transformation again)
+```{r pca for different cancer types, fig.cap=paste("PCA", c("scree plot", "pca plot"), "for TCGA cancer type", rep(names(other_data), each=2)), fig.width=rep(c(3,10), each=1), fig.height=rep(c(3,7), each=1)}
+gene_list_reduced <- c( "Tks4", "SRC", "WASL", "GRB2")
+for (ctype in names(other_data)){
+  indata_mx <- as.matrix(other_data[[ctype]][, gene_list_reduced])
+  rownames(indata_mx) <- other_data[[ctype]]$samples
+  pca <- prcomp(indata_mx, center=T, scale=T,
+                tol = sqrt(.Machine$double.eps), rank.=30)
+  # scree plot
+  pca.var <- pca$sdev^2
+  pca.var.per <- round(pca.var/sum(pca.var)*100, 1)
+  
+  sumvar <- 0
+  for (pcind in 1:length(pca.var)){
+    sumvar <- sumvar + pca.var.per[pcind]
+    #print(c(pcind, sumvar))
+    if (sumvar > 99.9){
+   # if (sumvar >= 100){
+      maxi <- pcind
+      #print(maxi)
+      break
+    }
+  }
+  vardf <- as.data.frame(cbind('PC'=1:maxi, 'variance'=pca.var.per[1:maxi]))
+  
+  p <- ggplot(data=vardf) +
+    geom_col(mapping=aes(x=PC, y=cumsum(variance)))+
+    xlab("Principal Component") +  ylab("Cumulative percent variation") +
+    geom_hline(yintercept=95, linetype="dashed",
+               color = "red", linewidth=1)
+  plot(p)
+  # save scree plot as well
+  figfile <- file.path("Figures", 
+                       paste("PCA_TCGA_reduced_genes_scree_plot_",
+                       ctype, ".pdf", sep=""))
+  ggsave(figfile, plot=p, height=5, width=5)
+  pca_res <- as_tibble(pca$x, rownames = "samples")
+  # also plot the pca plot with annotation
+  pca_annot <- inner_join(pca_res, other_data[[ctype]], by=c("samples"))
+  
+  nicexlabel <- paste('PC1 (', as.character(vardf$variance[1]), '%)', sep="")
+  niceylabel <- paste('PC2 (', as.character(vardf$variance[2]), '%)', sep="")
+  
+  # plot the results of the PCA analysis
+  p <- ggplot(data=pca_annot) +
+    geom_point(mapping=aes(x = PC1, y = PC2, col = sample_type),
+               size = 1, stroke = 1, fill="white")+
+    # color points as required
+    scale_color_manual("sample type", values = c("tumor" = "red", "normal" = "blue"))+
+    labs(x = nicexlabel, y = niceylabel)+
+    #geom_text(mapping=aes(x = PC1, y = PC2, label=samples), size=1)+
+    theme_gray(base_size = 20) # change the default font size in the grey theme
+  plot(p)
+  resfile <- file.path("Figures", 
+                     paste("PCA_TCGA_reduced_genes_pca_plot_",
+                       ctype, ".pdf", sep=""))
+  #gsave(resfile, plot=p, width=20, height=12)
+  ggsave(resfile, plot=p, width=10, height=6)  
+}
+```
